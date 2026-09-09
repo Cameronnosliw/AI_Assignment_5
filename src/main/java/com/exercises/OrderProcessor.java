@@ -1,5 +1,7 @@
 package com.exercises;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.List;
 
 public class OrderProcessor {
@@ -16,30 +18,61 @@ public class OrderProcessor {
         if (items == null || items.isEmpty()) {
             throw new IllegalArgumentException("Items list cannot be empty");
         }
+        if (currency == null || currency.isBlank()) {
+            throw new IllegalArgumentException("Currency cannot be null or blank");
+        }
 
-        // Bug 1: Null or zero exchange rate returns NullPointerException / Div by zero
-        Double rate = currency.equalsIgnoreCase("USD") ? 1.0 : rateService.getRateToUsd(currency);
+        // Bug fix: the original code used `Double rate = cond ? 1.0 : rateService.getRateToUsd(currency);`
+        // The ternary operator forces numeric promotion of the Double branch to a primitive double,
+        // which triggers an immediate, confusing NullPointerException whenever getRateToUsd(...)
+        // returns null (e.g. for an unsupported currency) -- even before the value is ever used.
+        // We now fetch the rate explicitly and turn an unsupported currency into a clear,
+        // caller-friendly IllegalArgumentException instead of an NPE.
+        double rate;
+        if (currency.equalsIgnoreCase("USD")) {
+            rate = 1.0;
+        } else {
+            Double fetchedRate = rateService.getRateToUsd(currency);
+            if (fetchedRate == null) {
+                throw new IllegalArgumentException("Unsupported currency: " + currency);
+            }
+            if (fetchedRate <= 0) {
+                throw new IllegalArgumentException("Exchange rate must be positive for currency: " + currency);
+            }
+            rate = fetchedRate;
+        }
 
-        double rawSubtotal = 0.0;
+        // Bug fix: summing/multiplying with primitive doubles and then rounding via
+        // Math.round(x * 100.0) / 100.0 is a classic source of off-by-one-cent errors
+        // (e.g. 2.675 is stored as 2.6749999999999998... in binary floating point, so the
+        // old code rounded it down to 2.67 instead of the correct 2.68). We use BigDecimal,
+        // seeded from Double.toString() via BigDecimal.valueOf(...), so decimal amounts like
+        // 2.675 are represented exactly and rounded predictably.
+        BigDecimal rawSubtotal = BigDecimal.ZERO;
         for (OrderItem item : items) {
-            // Bug 2: Doesn't check if item itself is null before calling methods
+            if (item == null) {
+                throw new IllegalArgumentException("Order item cannot be null");
+            }
             if (item.quantity() <= 0 || item.price() < 0) {
                 throw new IllegalArgumentException("Invalid item pricing or quantity");
             }
-            rawSubtotal += item.price() * item.quantity();
+            BigDecimal itemPrice = BigDecimal.valueOf(item.price());
+            BigDecimal itemQuantity = BigDecimal.valueOf(item.quantity());
+            rawSubtotal = rawSubtotal.add(itemPrice.multiply(itemQuantity));
         }
 
-        // Bug 3: Floating point precision drift on repeated discount fractions
-        double discountMultiplier = 1.0;
+        BigDecimal discountMultiplier;
         if ("TIER10".equalsIgnoreCase(promoCode)) {
-            discountMultiplier = 0.90;
+            discountMultiplier = new BigDecimal("0.90");
         } else if ("VIP50".equalsIgnoreCase(promoCode)) {
-            discountMultiplier = 0.50;
+            discountMultiplier = new BigDecimal("0.50");
+        } else {
+            discountMultiplier = BigDecimal.ONE;
         }
 
-        double totalInForeignCurrency = rawSubtotal * discountMultiplier;
-        double totalInUsd = totalInForeignCurrency * rate;
+        BigDecimal totalInForeignCurrency = rawSubtotal.multiply(discountMultiplier);
+        BigDecimal totalInUsd = totalInForeignCurrency.multiply(BigDecimal.valueOf(rate));
 
-        return Math.round(totalInUsd * 100.0) / 100.0;
+        return totalInUsd.setScale(2, RoundingMode.HALF_UP).doubleValue();
     }
 }
